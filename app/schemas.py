@@ -416,6 +416,204 @@ class CorrectionResponse(BaseModel):
     departed_at: datetime
     arrived_at: datetime
     invalidated_trace_ids: list[int]
+    invalidated_quality_check_ids: list[int] = Field(
+        default_factory=list,
+        description="Quality checks pinned to the superseded version.",
+    )
+
+
+# --------------------------------------------------------------- quality checks
+
+EXAMPLE_QA_PROBE_A = {
+    "probe_id": "P-A",
+    "readings": [
+        {"at": "2026-01-01T08:00:00Z", "temperature_c": 4.0},
+        {"at": "2026-01-01T08:10:00Z", "temperature_c": 4.2},
+        {"at": "2026-01-01T08:20:00Z", "temperature_c": 4.4},
+        {"at": "2026-01-01T10:00:00Z", "temperature_c": 5.0},
+    ],
+}
+EXAMPLE_QA_PROBE_B = {
+    "probe_id": "P-B",
+    "readings": [
+        {"at": "2026-01-01T08:00:00Z", "temperature_c": 3.8},
+        {"at": "2026-01-01T08:30:00Z", "temperature_c": 4.0},
+        {"at": "2026-01-01T10:00:00Z", "temperature_c": 4.1},
+    ],
+}
+EXAMPLE_QUALITY_CHECK = {
+    "batch_no": "B-1001",
+    "probes": [EXAMPLE_QA_PROBE_A, EXAMPLE_QA_PROBE_B],
+}
+
+
+class TemperatureReading(BaseModel):
+    """One probe reading. ``at`` is UTC (naive values are read as UTC)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    at: datetime
+    temperature_c: float = Field(
+        ge=-100, le=100, description="Measured temperature in °C."
+    )
+
+    @field_validator("at")
+    @classmethod
+    def _aware(cls, v: datetime, info) -> datetime:
+        return _to_utc(v, info.field_name)
+
+
+class ProbeEvidence(BaseModel):
+    """One probe's readings for the batch under review."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    probe_id: str = Field(max_length=128)
+    readings: list[TemperatureReading] = Field(min_length=1)
+
+    _normalise_id = field_validator("probe_id")(
+        lambda v, info: _clean(v, info.field_name)
+    )
+
+    @model_validator(mode="after")
+    def _unique_times(self) -> "ProbeEvidence":
+        seen: set[datetime] = set()
+        for reading in self.readings:
+            if reading.at in seen:
+                raise ValueError(
+                    f"probe {self.probe_id!r} has two readings at"
+                    f" {reading.at.isoformat()}"
+                )
+            seen.add(reading.at)
+        return self
+
+    def normalised(self) -> dict[str, Any]:
+        return {
+            "probe_id": self.probe_id,
+            "readings": sorted(
+                (
+                    {"at": reading.at, "temperature_c": reading.temperature_c}
+                    for reading in self.readings
+                ),
+                key=lambda item: item["at"],
+            ),
+        }
+
+
+class QualityCheckRequest(BaseModel):
+    """Two probes' temperature evidence for one transfer batch.
+
+    Readings may be submitted in any order and may extend beyond the batch
+    interval (they are clipped to departure→arrival). Each probe must cover
+    both ends of the interval with consecutive readings at most 10 minutes
+    apart for a release; anything less is reported as an evidence gap.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid", json_schema_extra={"example": EXAMPLE_QUALITY_CHECK}
+    )
+
+    batch_no: str = Field(max_length=128)
+    probes: list[ProbeEvidence] = Field(min_length=2, max_length=2)
+
+    _normalise_batch = field_validator("batch_no")(
+        lambda v, info: _clean(v, info.field_name)
+    )
+
+    @model_validator(mode="after")
+    def _distinct_probes(self) -> "QualityCheckRequest":
+        ids = [probe.probe_id for probe in self.probes]
+        if len(set(ids)) != len(ids):
+            raise ValueError("probe_id values must be distinct")
+        return self
+
+    def normalised(self) -> tuple[str, list[dict[str, Any]]]:
+        return self.batch_no, [probe.normalised() for probe in self.probes]
+
+
+class IntervalOut(BaseModel):
+    """A half-open interval ``[start, end)`` in UTC."""
+
+    start: datetime
+    end: datetime
+    duration_minutes: float
+
+
+class ProbeQualityResult(BaseModel):
+    probe_id: str
+    reading_count: int
+    first_reading_at: datetime
+    last_reading_at: datetime
+    covers_start: bool = Field(
+        description="Evidence reaches the batch departure instant exactly."
+    )
+    covers_end: bool = Field(
+        description="Evidence reaches the batch arrival instant exactly."
+    )
+    complete_coverage: bool
+    evaluated_minutes: float
+    lower_bound_minutes: float = Field(
+        description=(
+            "Longest excursion above 8 °C implied by the coldest consistent"
+            " curve (readings - 0.5 °C). A true violation is certain when"
+            " this exceeds 15 minutes."
+        )
+    )
+    upper_bound_minutes: float = Field(
+        description=(
+            "Longest excursion above 8 °C implied by the warmest consistent"
+            " curve (readings + 0.5 °C). No violation is possible when this"
+            " is at most 15 minutes."
+        )
+    )
+    guaranteed_excursions: list[IntervalOut] = Field(
+        description="Intervals above 8 °C under the lower envelope."
+    )
+    possible_excursions: list[IntervalOut] = Field(
+        description="Intervals above 8 °C under the upper envelope."
+    )
+    evidence_gaps: list[IntervalOut] = Field(
+        description="Parts of the batch interval with no usable evidence."
+    )
+
+
+class QualityBatchRef(BaseModel):
+    batch_no: str
+    version: int
+    departed_at: datetime
+    arrived_at: datetime
+    origin: str
+    destination: str
+
+
+class QualityCheckResponse(BaseModel):
+    check_id: int
+    status: str = Field(
+        description="released | anomalous | insufficient_evidence"
+    )
+    releasable: bool
+    reason: str
+    batch: QualityBatchRef
+    created_at: datetime
+    thresholds: dict[str, float]
+    anomalous_probe_ids: list[str]
+    incomplete_probe_ids: list[str]
+    uncertain_probe_ids: list[str]
+    probes: list[ProbeQualityResult]
+
+
+class QualityCheckSummary(BaseModel):
+    check_id: int
+    batch_no: str
+    batch_version: int
+    status: str
+    releasable: bool
+    invalidated: bool
+    created_at: datetime
+
+
+class QualityCheckListResponse(BaseModel):
+    checks: list[QualityCheckSummary]
 
 
 class DatasetResponse(BaseModel):

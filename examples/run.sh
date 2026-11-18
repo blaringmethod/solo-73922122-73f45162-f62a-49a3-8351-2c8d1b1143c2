@@ -49,6 +49,38 @@ echo "$TRACE" | pretty
 TRACE_ID=$(echo "$TRACE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["trace_id"])')
 
 echo
+echo "== cold-chain quality check for B${RUN}-1002 (two probes, 10-min cadence) =="
+python3 - "$RUN" >"$WORK/quality.json" <<'PY'
+import json, sys
+from datetime import datetime, timedelta, timezone
+
+run = sys.argv[1]
+start = datetime(2026, 1, 1, 20, 0, tzinfo=timezone.utc)
+end = datetime(2026, 1, 1, 22, 0, tzinfo=timezone.utc)
+
+def readings(base):
+    stamps, tick = [], start
+    while tick <= end:
+        stamps.append(
+            {"at": tick.isoformat().replace("+00:00", "Z"),
+             "temperature_c": round(base + 0.05 * ((tick - start) / timedelta(minutes=10)), 2)}
+        )
+        tick += timedelta(minutes=10)
+    return stamps
+
+print(json.dumps({
+    "batch_no": f"B{run}-1002",
+    "probes": [
+        {"probe_id": "P-A", "readings": readings(4.0)},
+        {"probe_id": "P-B", "readings": readings(4.4)},
+    ],
+}))
+PY
+curl -fsS -X POST "$API/quality-checks" \
+  -H 'Content-Type: application/json' \
+  --data @"$WORK/quality.json" | pretty
+
+echo
 echo "== correct B${RUN}-1002 (client saw version 1): Reference-Lab -> Cold-Room =="
 curl -fsS -X POST "$API/batches/B${RUN}-1002/corrections" \
   -H 'Content-Type: application/json' \

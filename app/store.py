@@ -14,6 +14,12 @@ result; a failure leaves zero result rows.
 
 *Invalidation*: a correction marks every completed trace that pinned the
 superseded version. Reading such a trace returns 409 instead of stale data.
+
+*A quality check* pins one batch version, evaluates temperature evidence and
+writes its verdict only when published. The pin is re-checked in the publishing
+transaction, so a correction interleaved with verification leaves no verdict.
+Recorded verdicts pinned to a superseded version are invalidated and can no
+longer be read as a release.
 """
 from __future__ import annotations
 
@@ -99,6 +105,34 @@ CREATE TABLE IF NOT EXISTS trace_invalidations (
     invalidated_at TEXT NOT NULL,
     reason         TEXT NOT NULL,
     PRIMARY KEY (trace_id, batch_no, version)
+);
+
+CREATE TABLE IF NOT EXISTS quality_checks (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    intake_id     INTEGER NOT NULL REFERENCES intakes(id),
+    batch_no      TEXT NOT NULL,
+    batch_version INTEGER NOT NULL CHECK (batch_version >= 1),
+    status        TEXT NOT NULL CHECK (
+        status IN ('released', 'anomalous', 'insufficient_evidence')
+    ),
+    releasable    INTEGER NOT NULL CHECK (releasable IN (0, 1)),
+    departed_at   TEXT NOT NULL,
+    arrived_at    TEXT NOT NULL,
+    probes_json   TEXT NOT NULL,
+    result_json   TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS quality_checks_batch
+    ON quality_checks(intake_id, batch_no, batch_version);
+
+CREATE TABLE IF NOT EXISTS quality_check_invalidations (
+    check_id       INTEGER PRIMARY KEY REFERENCES quality_checks(id)
+                   ON DELETE CASCADE,
+    batch_no       TEXT NOT NULL,
+    version        INTEGER NOT NULL,
+    invalidated_at TEXT NOT NULL,
+    reason         TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS request_log (
@@ -535,6 +569,23 @@ class Store:
                     " VALUES (?, ?, ?, ?, ?)",
                     (trace_id, batch_no, version, now, reason),
                 )
+            checks = conn.execute(
+                "SELECT id FROM quality_checks WHERE intake_id=? AND batch_no=?"
+                " AND batch_version=? AND status<>'pending'",
+                (intake_id, batch_no, version),
+            ).fetchall()
+            forced_out = sorted(int(row["id"]) for row in checks)
+            for check_id in forced_out:
+                conn.execute(
+                    "INSERT OR IGNORE INTO quality_check_invalidations(check_id,"
+                    " batch_no, version, invalidated_at, reason)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (check_id, batch_no, version, now, reason),
+                )
+                conn.execute(
+                    "UPDATE quality_checks SET releasable=0 WHERE id=?",
+                    (check_id,),
+                )
             return {
                 "batch_no": batch_no,
                 "previous_version": version,
@@ -544,6 +595,7 @@ class Store:
                 "departed_at": departed_at,
                 "arrived_at": arrived_at,
                 "invalidated_trace_ids": invalidated,
+                "invalidated_quality_check_ids": forced_out,
             }
 
     # ---------------------------------------------------------------- traces
@@ -816,6 +868,173 @@ class Store:
                 "   WHERE i.trace_id=t.id) AS invalidation_count"
                 " FROM traces t ORDER BY t.id DESC"
             ).fetchall()
+
+    # -------------------------------------------------------- quality checks
+
+    def begin_quality_check(
+        self,
+        *,
+        batch_no: str,
+    ) -> tuple[int, dict[str, Any]]:
+        """Pin the live version of ``batch_no`` for a quality check.
+
+        The batch lookup and the returned pin happen in one ``BEGIN IMMEDIATE``
+        transaction. The check row itself is written only when the verdict is
+        published (see :meth:`publish_quality_check`), so a failed or invalid
+        request leaves the ledger untouched.
+
+        Raises:
+            NotFoundError: no dataset or unknown batch.
+        """
+        with self.connection() as conn:
+            conn.execute("BEGIN")
+            try:
+                snapshot = self._snapshot_in(conn)
+            finally:
+                conn.execute("COMMIT")
+        if snapshot is None:
+            raise NotFoundError("no dataset")
+        batch = next(
+            (
+                item
+                for item in snapshot["batches"]
+                if item["batch_no"] == batch_no
+            ),
+            None,
+        )
+        if batch is None:
+            raise NotFoundError(f"batch {batch_no!r} not found")
+        return snapshot["intake_id"], {
+            "batch_no": batch_no,
+            "version": int(batch["version"]),
+            "departed_at": parse_iso(batch["departed_at"]),
+            "arrived_at": parse_iso(batch["arrived_at"]),
+        }
+
+    def publish_quality_check(
+        self,
+        *,
+        intake_id: int,
+        pinned: dict[str, Any],
+        probes: list[dict[str, Any]],
+        status: str,
+        releasable: bool,
+        result: dict[str, Any],
+    ) -> int:
+        """Write the verdict only if the pinned batch version is still live.
+
+        The version re-check and the insert share one transaction. If a
+        correction landed while the check was being computed, nothing is
+        written: the caller gets a conflict and must re-run against the new
+        version.
+
+        Raises:
+            ConflictError: the pinned version was superseded in the meantime.
+        """
+        with self.transaction() as conn:
+            live = conn.execute(
+                "SELECT version FROM batches WHERE intake_id=? AND batch_no=?"
+                " AND superseded=0",
+                (intake_id, pinned["batch_no"]),
+            ).fetchone()
+            if live is None or int(live["version"]) != int(pinned["version"]):
+                raise ConflictError(
+                    f"batch {pinned['batch_no']!r} was corrected during"
+                    " verification; the verdict is stale and was not recorded"
+                )
+            cur = conn.execute(
+                "INSERT INTO quality_checks(intake_id, batch_no, batch_version,"
+                " status, releasable, departed_at, arrived_at, probes_json,"
+                " result_json, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    int(intake_id),
+                    pinned["batch_no"],
+                    int(pinned["version"]),
+                    status,
+                    int(releasable),
+                    iso(pinned["departed_at"]),
+                    iso(pinned["arrived_at"]),
+                    json.dumps(
+                        [
+                            {
+                                "probe_id": probe["probe_id"],
+                                "readings": [
+                                    {
+                                        "at": iso(reading["at"]),
+                                        "temperature_c": float(
+                                            reading["temperature_c"]
+                                        ),
+                                    }
+                                    for reading in probe["readings"]
+                                ],
+                            }
+                            for probe in probes
+                        ]
+                    ),
+                    json.dumps(result),
+                    iso(utcnow()),
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def read_quality_check(self, id_: int) -> dict[str, Any] | None:
+        """Read the check, its pinned batch and invalidation markers atomically."""
+        with self.connection() as conn:
+            conn.execute("BEGIN")
+            try:
+                row = conn.execute(
+                    "SELECT * FROM quality_checks WHERE id=?", (id_,)
+                ).fetchone()
+                if row is None:
+                    return None
+                invalidations = conn.execute(
+                    "SELECT * FROM quality_check_invalidations WHERE check_id=?",
+                    (id_,),
+                ).fetchall()
+                batch = conn.execute(
+                    "SELECT batch_no, version, origin, destination,"
+                    " departed_at, arrived_at FROM batches"
+                    " WHERE intake_id=? AND batch_no=? AND version=?",
+                    (
+                        int(row["intake_id"]),
+                        row["batch_no"],
+                        int(row["batch_version"]),
+                    ),
+                ).fetchone()
+                return {
+                    "check": row,
+                    "batch": batch,
+                    "invalidations": invalidations,
+                    "probes": json.loads(row["probes_json"]),
+                    "result": json.loads(row["result_json"]),
+                }
+            finally:
+                conn.execute("COMMIT")
+
+    def quality_check_history(
+        self, *, batch_no: str | None = None
+    ) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            if batch_no is None:
+                return conn.execute(
+                    "SELECT * FROM quality_checks ORDER BY id DESC"
+                ).fetchall()
+            return conn.execute(
+                "SELECT * FROM quality_checks WHERE batch_no=?"
+                " ORDER BY id DESC",
+                (batch_no,),
+            ).fetchall()
+
+    def quality_check_invalidated(self, check_id: int) -> bool:
+        with self.connection() as conn:
+            return (
+                conn.execute(
+                    "SELECT 1 FROM quality_check_invalidations WHERE check_id=?",
+                    (check_id,),
+                ).fetchone()
+                is not None
+            )
 
     # ----------------------------------------------------------------- audit
 

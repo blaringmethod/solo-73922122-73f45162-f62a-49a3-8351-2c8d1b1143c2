@@ -9,6 +9,11 @@ Endpoints
 ``POST /traces``                   run a trace on a pinned snapshot
 ``GET  /traces``                    list accepted traces
 ``GET  /traces/{id}``               re-read a published snapshot result
+``POST /quality-checks``            cold-chain temperature evidence for one batch
+``GET  /quality-checks``            list recorded checks
+``GET  /quality-checks/{id}``       re-read a verdict (409 once invalidated)
+``GET  /quality-checks/{id}/invalidations``
+                                   correction records for a verdict
 ``GET  /healthz``                   readiness probe
 """
 from __future__ import annotations
@@ -22,7 +27,7 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from . import tracing
+from . import quality, tracing
 from .schemas import (
     AffectedSample,
     BatchCorrection,
@@ -32,8 +37,15 @@ from .schemas import (
     ErrorBody,
     IntakeRequest,
     IntakeResponse,
+    IntervalOut,
     InvalidationInfo,
     PathLeg,
+    ProbeQualityResult,
+    QualityBatchRef,
+    QualityCheckListResponse,
+    QualityCheckRequest,
+    QualityCheckResponse,
+    QualityCheckSummary,
     SnapshotInfo,
     TraceListResponse,
     TraceRequest,
@@ -76,13 +88,23 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "* Corrections are versioned (`seen_version` optimistic lock),"
             " replace the old record and invalidate snapshots pinned to it.\n"
             "* `POST /traces` pins a snapshot at acceptance time and publishes"
-            " results only when complete; failed traces expose no partial rows."
+            " results only when complete; failed traces expose no partial rows.\n"
+            "* `POST /quality-checks` reviews two probes' readings for one"
+            " batch. With ±0.5 °C measurement error and linear variation"
+            " between readings it reports lower/upper bounds on the longest"
+            " excursion above 8 °C. A release requires complete coverage by"
+            " both probes and both upper bounds within 15 minutes; corrections"
+            " invalidate stale verdicts."
         ),
         lifespan=lifespan,
         openapi_tags=[
             {"name": "intake", "description": "Register samples and batches."},
             {"name": "corrections", "description": "Versioned batch replacement."},
             {"name": "traces", "description": "Contamination trace snapshots."},
+            {
+                "name": "quality",
+                "description": "Cold-chain temperature evidence per batch.",
+            },
         ],
     )
     app.state.store = store
@@ -152,6 +174,79 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 batches=[BatchOut(**row) for row in bundle["batches"]],
             ),
             error=trace["error"],
+        )
+
+    def _interval_out(item: dict[str, Any]) -> IntervalOut:
+        return IntervalOut(
+            start=parse_iso(item["start"]),
+            end=parse_iso(item["end"]),
+            duration_minutes=float(item["duration_minutes"]),
+        )
+
+    def _quality_pending(check_id: int) -> HTTPException:
+        """A check in flight has no published verdict yet."""
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "quality_check_pending",
+                "message": "quality check has not been published yet; retry later",
+                "details": {"check_id": check_id, "status": "pending"},
+            },
+        )
+
+    def _quality_response(bundle: dict[str, Any]) -> QualityCheckResponse:
+        check = bundle["check"]
+        result = bundle["result"]
+        batch = bundle["batch"]
+        if batch is None:  # pragma: no cover - pinned rows are never deleted
+            raise HTTPException(status_code=500, detail="pinned batch missing")
+        probes = [
+            ProbeQualityResult(
+                probe_id=probe["probe_id"],
+                reading_count=int(probe["reading_count"]),
+                first_reading_at=parse_iso(probe["first_reading_at"]),
+                last_reading_at=parse_iso(probe["last_reading_at"]),
+                covers_start=bool(probe["covers_start"]),
+                covers_end=bool(probe["covers_end"]),
+                complete_coverage=bool(probe["complete_coverage"]),
+                evaluated_minutes=float(probe["evaluated_minutes"]),
+                lower_bound_minutes=float(probe["lower_bound_minutes"]),
+                upper_bound_minutes=float(probe["upper_bound_minutes"]),
+                guaranteed_excursions=[
+                    _interval_out(item)
+                    for item in probe["guaranteed_excursions"]
+                ],
+                possible_excursions=[
+                    _interval_out(item) for item in probe["possible_excursions"]
+                ],
+                evidence_gaps=[
+                    _interval_out(item) for item in probe["evidence_gaps"]
+                ],
+            )
+            for probe in result["probes"]
+        ]
+        return QualityCheckResponse(
+            check_id=int(check["id"]),
+            status=check["status"],
+            releasable=bool(check["releasable"]),
+            reason=result["reason"],
+            batch=QualityBatchRef(
+                batch_no=check["batch_no"],
+                version=int(check["batch_version"]),
+                departed_at=parse_iso(check["departed_at"]),
+                arrived_at=parse_iso(check["arrived_at"]),
+                origin=batch["origin"],
+                destination=batch["destination"],
+            ),
+            created_at=parse_iso(check["created_at"]),
+            thresholds={
+                key: float(value)
+                for key, value in result["thresholds"].items()
+            },
+            anomalous_probe_ids=list(result["anomalous_probe_ids"]),
+            incomplete_probe_ids=list(result["incomplete_probe_ids"]),
+            uncertain_probe_ids=list(result["uncertain_probe_ids"]),
+            probes=probes,
         )
 
     # ----------------------------------------------------------------- routes
@@ -407,7 +502,243 @@ def create_app(db_path: str | None = None) -> FastAPI:
             for row in store.invalidations(trace_id)
         ]
 
+    @app.post(
+        "/quality-checks",
+        response_model=QualityCheckResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["quality"],
+        summary="Review a batch's cold-chain evidence from two probes",
+        responses={
+            404: {"model": ErrorBody, "description": "No dataset or unknown batch"},
+            409: {
+                "model": ErrorBody,
+                "description": "Batch corrected during verification; nothing recorded",
+            },
+            500: {
+                "model": ErrorBody,
+                "description": "Verification failed; nothing recorded",
+            },
+        },
+    )
+    def create_quality_check(payload: QualityCheckRequest) -> QualityCheckResponse:
+        batch_no, probes = payload.normalised()
+        try:
+            intake_id, pinned = store.begin_quality_check(batch_no=batch_no)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        try:
+            outcome = quality.evaluate(
+                batch={
+                    "batch_no": pinned["batch_no"],
+                    "departed_at": pinned["departed_at"],
+                    "arrived_at": pinned["arrived_at"],
+                },
+                probes=probes,
+            )
+            check_id = store.publish_quality_check(
+                intake_id=intake_id,
+                pinned=pinned,
+                probes=probes,
+                status=outcome["status"],
+                releasable=outcome["releasable"],
+                result=_quality_result_json(outcome),
+            )
+        except ConflictError as exc:
+            # A correction slipped in between pinning and publication. The
+            # verdict would describe superseded values, so nothing is stored.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "snapshot_changed",
+                    "message": str(exc),
+                    "details": {
+                        "batch_no": pinned["batch_no"],
+                        "pinned_version": pinned["version"],
+                    },
+                },
+            ) from exc
+        except quality.QualityFailure as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "quality_check_failed",
+                    "message": str(exc),
+                    "details": {"batch_no": pinned["batch_no"]},
+                },
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - never record a partial verdict
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "quality_check_failed",
+                    "message": f"{type(exc).__name__}: {exc}",
+                    "details": {"batch_no": pinned["batch_no"]},
+                },
+            ) from exc
+
+        bundle = store.read_quality_check(check_id)
+        assert bundle is not None
+        if bundle["invalidations"]:
+            # A correction committed right after publication. Never hand back
+            # a release conclusion that is already superseded.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "snapshot_changed",
+                    "message": (
+                        "the batch was corrected while the verdict was being"
+                        " recorded; the stale verdict was not returned"
+                    ),
+                    "details": {
+                        "check_id": check_id,
+                        "batch_no": pinned["batch_no"],
+                        "pinned_version": pinned["version"],
+                    },
+                },
+            )
+        store.log(
+            "quality_check",
+            {
+                "check_id": check_id,
+                "batch_no": pinned["batch_no"],
+                "version": pinned["version"],
+                "status": outcome["status"],
+            },
+        )
+        return _quality_response(bundle)
+    @app.get(
+        "/quality-checks",
+        response_model=QualityCheckListResponse,
+        tags=["quality"],
+        summary="List recorded quality checks",
+    )
+    def list_quality_checks(
+        batch_no: str | None = None,
+    ) -> QualityCheckListResponse:
+        rows = store.quality_check_history(batch_no=batch_no)
+        return QualityCheckListResponse(
+            checks=[
+                QualityCheckSummary(
+                    check_id=int(row["id"]),
+                    batch_no=row["batch_no"],
+                    batch_version=int(row["batch_version"]),
+                    status=row["status"],
+                    releasable=bool(row["releasable"]),
+                    invalidated=store.quality_check_invalidated(int(row["id"])),
+                    created_at=parse_iso(row["created_at"]),
+                )
+                for row in rows
+            ]
+        )
+
+    @app.get(
+        "/quality-checks/{check_id}",
+        response_model=QualityCheckResponse,
+        tags=["quality"],
+        summary="Read one quality-check verdict",
+        responses={
+            404: {"model": ErrorBody, "description": "Unknown check"},
+            409: {
+                "model": ErrorBody,
+                "description": "Verdict invalidated by a batch correction",
+            },
+        },
+    )
+    def get_quality_check(check_id: int) -> QualityCheckResponse:
+        bundle = store.read_quality_check(check_id)
+        if bundle is None:
+            raise HTTPException(status_code=404, detail="quality check not found")
+        if bundle["check"]["status"] == "pending":
+            raise _quality_pending(check_id)
+        if bundle["invalidations"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "quality_check_invalidated",
+                    "message": (
+                        "the batch was corrected after this verdict was"
+                        " recorded; run a new quality check"
+                    ),
+                    "details": {
+                        "check_id": check_id,
+                        "invalidations": [
+                            InvalidationInfo(
+                                batch_no=row["batch_no"],
+                                version=int(row["version"]),
+                                invalidated_at=parse_iso(row["invalidated_at"]),
+                                reason=row["reason"],
+                            ).model_dump(mode="json")
+                            for row in bundle["invalidations"]
+                        ],
+                    },
+                },
+            )
+        return _quality_response(bundle)
+
+    @app.get(
+        "/quality-checks/{check_id}/invalidations",
+        response_model=list[InvalidationInfo],
+        tags=["quality"],
+        summary="Invalidation records for a quality check",
+    )
+    def get_quality_check_invalidations(check_id: int) -> list[InvalidationInfo]:
+        bundle = store.read_quality_check(check_id)
+        if bundle is None:
+            raise HTTPException(status_code=404, detail="quality check not found")
+        if bundle["check"]["status"] == "pending":
+            raise _quality_pending(check_id)
+        return [
+            InvalidationInfo(
+                batch_no=row["batch_no"],
+                version=int(row["version"]),
+                invalidated_at=parse_iso(row["invalidated_at"]),
+                reason=row["reason"],
+            )
+            for row in bundle["invalidations"]
+        ]
+
     return app
+
+
+def _quality_result_json(outcome: dict[str, Any]) -> dict[str, Any]:
+    """Serialise the evaluator's verdict into the stored/response shape."""
+
+    def render(intervals: list[Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "start": item.start.isoformat(),
+                "end": item.end.isoformat(),
+                "duration_minutes": item.minutes,
+            }
+            for item in intervals
+        ]
+
+    return {
+        "reason": outcome["reason"],
+        "thresholds": outcome["thresholds"],
+        "anomalous_probe_ids": outcome["anomalous_probe_ids"],
+        "incomplete_probe_ids": outcome["incomplete_probe_ids"],
+        "uncertain_probe_ids": outcome["uncertain_probe_ids"],
+        "probes": [
+            {
+                "probe_id": probe["probe_id"],
+                "reading_count": probe["reading_count"],
+                "first_reading_at": probe["first_reading_at"].isoformat(),
+                "last_reading_at": probe["last_reading_at"].isoformat(),
+                "covers_start": probe["covers_start"],
+                "covers_end": probe["covers_end"],
+                "complete_coverage": probe["complete_coverage"],
+                "evaluated_minutes": probe["evaluated_minutes"],
+                "lower_bound_minutes": probe["lower_bound_minutes"],
+                "upper_bound_minutes": probe["upper_bound_minutes"],
+                "guaranteed_excursions": render(probe["guaranteed_excursions"]),
+                "possible_excursions": render(probe["possible_excursions"]),
+                "evidence_gaps": render(probe["evidence_gaps"]),
+            }
+            for probe in outcome["probes"]
+        ],
+    }
 
 
 def _load_json(value: str) -> Any:
